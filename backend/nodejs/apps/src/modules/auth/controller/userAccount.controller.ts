@@ -213,6 +213,69 @@ export class UserAccountController {
       let result = await this.iamService.getUserByEmail(email, authToken);
 
       if (result.statusCode !== 200) {
+        // User not found - check if org has Microsoft OAuth enabled by email domain
+        const domain = this.getDomainFromEmail(email);
+
+        if (domain) {
+          // Look up org auth config by domain
+          const orgAuthConfig = await OrgAuthConfig.findOne({
+            domain: domain,
+            isDeleted: false,
+          });
+
+          if (orgAuthConfig) {
+            // Check if Microsoft OAuth is enabled for this org
+            const hasMicrosoftAuth = orgAuthConfig.authSteps.some(step =>
+              step.allowedMethods.some(m => m.type === 'microsoft')
+            );
+
+            if (hasMicrosoftAuth) {
+              // Create session WITH orgId for JIT provisioning
+              const session = await this.sessionService.createSession({
+                userId: "NOT_FOUND",
+                email: email,
+                orgId: orgAuthConfig.orgId.toString(),  // Critical: include orgId
+                authConfig: orgAuthConfig.authSteps,
+                currentStep: 0,
+              });
+
+              if (!session) {
+                throw new InternalServerError('Failed to create session');
+              }
+              if (session.token) {
+                res.setHeader('x-session-token', session.token);
+              }
+
+              const allowedMethods = session.authConfig[0]?.allowedMethods.map((m: any) => m.type) || [];
+              const authProviders: Record<string, any> = {};
+
+              // Fetch Microsoft auth config if available
+              if (allowedMethods.includes('microsoft')) {
+                try {
+                  const configManagerResponse = await this.configurationManagerService.getConfig(
+                    this.config.cmBackend,
+                    MICROSOFT_AUTH_CONFIG_PATH,
+                    { _id: 'temp', orgId: orgAuthConfig.orgId.toString() },
+                    this.config.scopedJwtSecret,
+                  );
+                  authProviders.microsoft = configManagerResponse.data;
+                } catch (err) {
+                  this.logger.warn('Failed to fetch Microsoft auth config for JIT user', { domain });
+                }
+              }
+
+              res.json({
+                currentStep: 0,
+                allowedMethods,
+                message: 'Authentication initialized',
+                authProviders,
+              });
+              return;
+            }
+          }
+        }
+
+        // Fallback: No Microsoft OAuth available - return password only
         const session = await this.sessionService.createSession({
           userId: "NOT_FOUND",
           email: email,
@@ -233,7 +296,6 @@ export class UserAccountController {
           authProviders: {},
         });
         return;
-        // throw new NotFoundError(result.data);
       }
       const user = result.data;
       // const domain = getDomainFromEmail(email);
@@ -1248,9 +1310,24 @@ export class UserAccountController {
       }
 
       if (sessionInfo.userId === "NOT_FOUND") {
-        throw new BadRequestError(
-          "Incorrect password, please try again.",
-        );
+        // Only allow Microsoft OAuth for JIT provisioning of new users
+        if (method !== AuthMethodType.MICROSOFT) {
+          throw new BadRequestError(
+            "User not found. Please contact your administrator.",
+          );
+        }
+
+        // Verify orgId is present for JIT provisioning
+        if (!sessionInfo.orgId) {
+          throw new BadRequestError(
+            "Cannot provision user: organization not identified.",
+          );
+        }
+
+        this.logger.info('Allowing Microsoft OAuth for JIT provisioning', {
+          email: sessionInfo.email,
+          orgId: sessionInfo.orgId,
+        });
       }
 
       const currentStepConfig = sessionInfo.authConfig[sessionInfo.currentStep];

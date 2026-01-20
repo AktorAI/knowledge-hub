@@ -369,7 +369,7 @@ class EntityEventService(BaseEventService):
                 )
                 return False
 
-            # Find Default team for this org
+            # Find or create Default team for this org
             query = f"""
                 FOR team IN {CollectionNames.TEAMS.value}
                     FILTER team.orgId == @org_id AND team.name == 'Default'
@@ -379,10 +379,26 @@ class EntityEventService(BaseEventService):
             teams = list(cursor)
 
             if not teams:
-                self.logger.warning(f"Default team not found for org {org_id}")
-                return False
-
-            team = teams[0]
+                # Create Default team on-demand for existing orgs that don't have one
+                self.logger.info(f"Creating Default team on-demand for org {org_id}")
+                team_key = str(uuid4())
+                team_timestamp = get_epoch_timestamp_in_ms()
+                team_data = {
+                    "_key": team_key,
+                    "name": "Default",
+                    "description": "Default team for all new users",
+                    "orgId": org_id,
+                    "createdAtTimestamp": team_timestamp,
+                    "updatedAtTimestamp": team_timestamp,
+                }
+                await self.arango_service.batch_upsert_nodes(
+                    [team_data],
+                    CollectionNames.TEAMS.value,
+                )
+                self.logger.info(f"✅ Created Default team on-demand for org {org_id}")
+                team = team_data
+            else:
+                team = teams[0]
             current_timestamp = get_epoch_timestamp_in_ms()
 
             # Create permission edge for team membership
