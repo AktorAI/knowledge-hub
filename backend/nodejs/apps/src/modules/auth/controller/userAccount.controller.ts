@@ -213,69 +213,100 @@ export class UserAccountController {
       let result = await this.iamService.getUserByEmail(email, authToken);
 
       if (result.statusCode !== 200) {
-        // User not found - check if org has Microsoft OAuth enabled by email domain
-        const domain = this.getDomainFromEmail(email);
+        // User not found - use default org auth config for JIT provisioning
+        // This allows new users to authenticate using the organization's configured auth methods
+        const orgAuthConfig = await OrgAuthConfig.findOne({
+          isDeleted: false,
+        });
 
-        if (domain) {
-          // Look up org auth config by domain
-          const orgAuthConfig = await OrgAuthConfig.findOne({
-            domain: domain,
-            isDeleted: false,
+        if (orgAuthConfig) {
+          // Create session WITH orgId for JIT provisioning
+          const session = await this.sessionService.createSession({
+            userId: "NOT_FOUND",
+            email: email,
+            orgId: orgAuthConfig.orgId.toString(),
+            authConfig: orgAuthConfig.authSteps,
+            currentStep: 0,
           });
 
-          if (orgAuthConfig) {
-            // Check if Microsoft OAuth is enabled for this org
-            const hasMicrosoftAuth = orgAuthConfig.authSteps.some(step =>
-              step.allowedMethods.some(m => m.type === 'microsoft')
-            );
+          if (!session) {
+            throw new InternalServerError('Failed to create session');
+          }
+          if (session.token) {
+            res.setHeader('x-session-token', session.token);
+          }
 
-            if (hasMicrosoftAuth) {
-              // Create session WITH orgId for JIT provisioning
-              const session = await this.sessionService.createSession({
-                userId: "NOT_FOUND",
-                email: email,
-                orgId: orgAuthConfig.orgId.toString(),  // Critical: include orgId
-                authConfig: orgAuthConfig.authSteps,
-                currentStep: 0,
-              });
+          const allowedMethods = session.authConfig[0]?.allowedMethods.map((m: any) => m.type) || [];
+          const authProviders: Record<string, any> = {};
+          const tempUser = { _id: 'temp', orgId: orgAuthConfig.orgId.toString() };
 
-              if (!session) {
-                throw new InternalServerError('Failed to create session');
-              }
-              if (session.token) {
-                res.setHeader('x-session-token', session.token);
-              }
-
-              const allowedMethods = session.authConfig[0]?.allowedMethods.map((m: any) => m.type) || [];
-              const authProviders: Record<string, any> = {};
-
-              // Fetch Microsoft auth config if available
-              if (allowedMethods.includes('microsoft')) {
-                try {
-                  const configManagerResponse = await this.configurationManagerService.getConfig(
-                    this.config.cmBackend,
-                    MICROSOFT_AUTH_CONFIG_PATH,
-                    { _id: 'temp', orgId: orgAuthConfig.orgId.toString() },
-                    this.config.scopedJwtSecret,
-                  );
-                  authProviders.microsoft = configManagerResponse.data;
-                } catch (err) {
-                  this.logger.warn('Failed to fetch Microsoft auth config for JIT user', { domain });
-                }
-              }
-
-              res.json({
-                currentStep: 0,
-                allowedMethods,
-                message: 'Authentication initialized',
-                authProviders,
-              });
-              return;
+          // Fetch auth provider configs for all configured methods
+          if (allowedMethods.includes('google')) {
+            try {
+              const configManagerResponse = await this.configurationManagerService.getConfig(
+                this.config.cmBackend,
+                GOOGLE_AUTH_CONFIG_PATH,
+                tempUser,
+                this.config.scopedJwtSecret,
+              );
+              authProviders.google = configManagerResponse.data;
+            } catch (err) {
+              this.logger.warn('Failed to fetch Google auth config for JIT user');
             }
           }
+
+          if (allowedMethods.includes('microsoft')) {
+            try {
+              const configManagerResponse = await this.configurationManagerService.getConfig(
+                this.config.cmBackend,
+                MICROSOFT_AUTH_CONFIG_PATH,
+                tempUser,
+                this.config.scopedJwtSecret,
+              );
+              authProviders.microsoft = configManagerResponse.data;
+            } catch (err) {
+              this.logger.warn('Failed to fetch Microsoft auth config for JIT user');
+            }
+          }
+
+          if (allowedMethods.includes(AuthMethodType.AZURE_AD)) {
+            try {
+              const configManagerResponse = await this.configurationManagerService.getConfig(
+                this.config.cmBackend,
+                AZURE_AD_AUTH_CONFIG_PATH,
+                tempUser,
+                this.config.scopedJwtSecret,
+              );
+              authProviders.azuread = configManagerResponse.data;
+            } catch (err) {
+              this.logger.warn('Failed to fetch Azure AD auth config for JIT user');
+            }
+          }
+
+          if (allowedMethods.includes(AuthMethodType.OAUTH)) {
+            try {
+              const configManagerResponse = await this.configurationManagerService.getConfig(
+                this.config.cmBackend,
+                OAUTH_AUTH_CONFIG_PATH,
+                tempUser,
+                this.config.scopedJwtSecret,
+              );
+              authProviders.oauth = configManagerResponse.data;
+            } catch (err) {
+              this.logger.warn('Failed to fetch OAuth auth config for JIT user');
+            }
+          }
+
+          res.json({
+            currentStep: 0,
+            allowedMethods,
+            message: 'Authentication initialized',
+            authProviders,
+          });
+          return;
         }
 
-        // Fallback: No Microsoft OAuth available - return password only
+        // Fallback: No org auth config found - return password only
         const session = await this.sessionService.createSession({
           userId: "NOT_FOUND",
           email: email,
@@ -1310,8 +1341,15 @@ export class UserAccountController {
       }
 
       if (sessionInfo.userId === "NOT_FOUND") {
-        // Only allow Microsoft OAuth for JIT provisioning of new users
-        if (method !== AuthMethodType.MICROSOFT) {
+        // Allow OAuth methods (Google, Microsoft, Azure AD, OAuth) for JIT provisioning of new users
+        const jitAllowedMethods = [
+          AuthMethodType.GOOGLE,
+          AuthMethodType.MICROSOFT,
+          AuthMethodType.AZURE_AD,
+          AuthMethodType.OAUTH,
+        ];
+
+        if (!jitAllowedMethods.includes(method as AuthMethodType)) {
           throw new BadRequestError(
             "User not found. Please contact your administrator.",
           );
@@ -1324,9 +1362,10 @@ export class UserAccountController {
           );
         }
 
-        this.logger.info('Allowing Microsoft OAuth for JIT provisioning', {
+        this.logger.info('Allowing OAuth for JIT provisioning', {
           email: sessionInfo.email,
           orgId: sessionInfo.orgId,
+          method: method,
         });
       }
 
@@ -1351,38 +1390,47 @@ export class UserAccountController {
 
       let user;
       if (!userFindResult) {
-        // JIT Provisioning for Microsoft OAuth - ONLY for NEW users
-        if (method === AuthMethodType.MICROSOFT) {
-          this.logger.info('User not found, initiating JIT provisioning for Microsoft OAuth', {
+        // JIT Provisioning for OAuth methods - ONLY for NEW users
+        const jitAllowedMethods = [
+          AuthMethodType.GOOGLE,
+          AuthMethodType.MICROSOFT,
+          AuthMethodType.AZURE_AD,
+          AuthMethodType.OAUTH,
+        ];
+
+        if (jitAllowedMethods.includes(method as AuthMethodType)) {
+          this.logger.info('User not found, initiating JIT provisioning', {
             email: sessionInfo.email,
+            method: method,
           });
 
           // Decode the idToken to extract user details for provisioning
           const idToken = credentials?.idToken;
-          let microsoftUserDetails: Record<string, any> = {};
+          let oauthUserDetails: Record<string, any> = {};
           if (idToken) {
             const decoded = jwt.decode(idToken) as Record<string, any>;
             if (decoded) {
-              microsoftUserDetails = {
+              oauthUserDetails = {
                 givenName: decoded.given_name || decoded.givenName,
                 surname: decoded.family_name || decoded.surname,
                 displayName: decoded.name || decoded.displayName,
-                email: decoded.email || decoded.preferred_username,
+                email: decoded.email || decoded.preferred_username || sessionInfo.email,
               };
             }
           }
 
-          // Provision the new user
+          // Provision the new user using the same provisioning method
           user = await this.userController.provisionMicrosoftUser(
             sessionInfo.email,
-            microsoftUserDetails,
+            oauthUserDetails,
             sessionInfo.orgId,
             this.logger,
           );
 
-          this.logger.info('JIT provisioning completed for Microsoft OAuth user', {
+          this.logger.info('JIT provisioning completed', {
             email: sessionInfo.email,
             userId: user._id,
+            method: method,
           });
         } else {
           throw new NotFoundError('User not found');
