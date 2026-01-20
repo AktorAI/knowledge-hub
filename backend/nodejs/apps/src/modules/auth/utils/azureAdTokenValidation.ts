@@ -13,6 +13,7 @@ const logger = Logger.getInstance({
 export const validateAzureAdUser = async (
   credentials: Record<string, any>,
   tenantId: string,
+  sessionEmail?: string,
 ): Promise<any | null> => {
   try {
     const idToken = credentials?.idToken;
@@ -27,7 +28,7 @@ export const validateAzureAdUser = async (
 
     // if (handleAzureAuthCallback(credentials, email, decoded) == null) {
     //   return { statusCode: 400 };
-    if (handleAzureAuthCallback(credentials, decoded) == null) {
+    if (handleAzureAuthCallback(credentials, decoded, sessionEmail) == null) {
       throw new BadRequestError('Error in Azure Auth CallBack');
     }
 
@@ -58,6 +59,7 @@ export const validateAzureAdUser = async (
 export const handleAzureAuthCallback = async (
   credentials: Record<string, any>,
   decoded: Record<string, any>,
+  sessionEmail?: string,
 ) => {
   try {
     const accessToken = credentials?.accessToken;
@@ -81,10 +83,16 @@ export const handleAzureAuthCallback = async (
       return accessToken;
     }
 
+    // Expanded fallback chain for UPN extraction
+    // Supports various Microsoft account types (work, B2B guest, personal)
     const userPrincipalName = (
       decodedToken?.upn ||
       decoded?.payload?.email ||
+      decoded?.payload?.preferred_username ||
+      decodedToken?.preferred_username ||
+      decodedToken?.unique_name ||
       credentials.account?.username ||
+      sessionEmail ||  // Final fallback: email user typed at login
       ''
     ).toLowerCase();
     if (!userPrincipalName) {

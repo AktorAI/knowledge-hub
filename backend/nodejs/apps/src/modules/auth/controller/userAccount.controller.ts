@@ -1180,6 +1180,7 @@ export class UserAccountController {
     user: Record<string, any>,
     credentials: Record<string, string>,
     ip: string,
+    sessionEmail?: string,
   ) {
     const configManagerResponse =
       await this.configurationManagerService.getConfig(
@@ -1190,7 +1191,7 @@ export class UserAccountController {
       );
     const { tenantId } = configManagerResponse.data;
 
-    await validateAzureAdUser(credentials, tenantId);
+    await validateAzureAdUser(credentials, tenantId, sessionEmail);
 
     await UserActivities.create({
       email: user.email,
@@ -1204,6 +1205,7 @@ export class UserAccountController {
     user: Record<string, any>,
     credentials: Record<string, string>,
     ip: string,
+    sessionEmail?: string,
   ) {
     const configManagerResponse =
       await this.configurationManagerService.getConfig(
@@ -1213,7 +1215,7 @@ export class UserAccountController {
         this.config.scopedJwtSecret,
       );
     const { tenantId } = configManagerResponse.data;
-    await validateAzureAdUser(credentials, tenantId);
+    await validateAzureAdUser(credentials, tenantId, sessionEmail);
 
     await UserActivities.create({
       email: user.email,
@@ -1457,13 +1459,14 @@ export class UserAccountController {
           await this.authenticateWithGoogle(user, credentials, req.ip!);
           break;
         case AuthMethodType.AZURE_AD:
-          await this.authenticateWithAzureAd(user, credentials, req.ip!);
+          await this.authenticateWithAzureAd(user, credentials, req.ip!, sessionInfo.email);
           break;
         case AuthMethodType.MICROSOFT:
           await this.authenticateWithMicrosoft(
             user,
             credentials,
             req.ip || ' ',
+            sessionInfo.email,
           );
           break;
         case AuthMethodType.OAUTH:

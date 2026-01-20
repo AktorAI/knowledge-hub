@@ -9372,9 +9372,11 @@ class BaseArangoService:
                     FILTER user_team_perm._to == CONCAT('teams/', team_id)
                     FILTER user_team_perm.type == "USER"
 
+                    // Use team's role on KB if available, otherwise fall back to user's team role
+                    LET effective_role = kb_team_perm.role || user_team_perm.role
                     RETURN {
-                        role: user_team_perm.role,
-                        priority: role_priority[user_team_perm.role] || 0
+                        role: effective_role,
+                        priority: role_priority[effective_role] || 0
                     }
             """
 
@@ -9608,8 +9610,8 @@ class BaseArangoService:
                         FILTER STARTS_WITH(user_team_perm._to, "teams/")
                         RETURN {{
                             team_id: SPLIT(user_team_perm._to, '/')[1],
-                            role: user_team_perm.role,
-                            priority: @role_priority[user_team_perm.role] || 0
+                            user_team_role: user_team_perm.role,
+                            user_team_priority: @role_priority[user_team_perm.role] || 0
                         }}
                 )
 
@@ -9625,11 +9627,13 @@ class BaseArangoService:
                         FILTER kb.groupType == @kb_type
                         FILTER kb.connectorName == @kb_connector
                         {additional_filters}
+                        // Use team's role on KB if available, otherwise fall back to user's team role
+                        LET effective_role = kb_team_perm.role || team_info.user_team_role
                         RETURN {{
                             kb_id: kb._key,
                             kb_doc: kb,
-                            role: team_info.role,
-                            priority: team_info.priority,
+                            role: effective_role,
+                            priority: @role_priority[effective_role] || 0,
                             is_direct: false
                         }}
             )

@@ -146,7 +146,7 @@ class EntityEventService(BaseEventService):
         """
         Create a Default team for the organization.
         This team is used to automatically add new users during JIT provisioning.
-        The admin user (org creator) will be added as OWNER when the userAdded event is processed.
+        Admin users in the org will be given OWNER permission on this team.
         """
         try:
             current_timestamp = get_epoch_timestamp_in_ms()
@@ -182,6 +182,48 @@ class EntityEventService(BaseEventService):
                 [team_data],
                 CollectionNames.TEAMS.value,
             )
+
+            # Find admin users (users who have OWNER permission on any team in this org)
+            # This identifies users who are likely org admins
+            admin_users_query = f"""
+                FOR user IN {CollectionNames.USERS.value}
+                    FILTER user.orgId == @org_id
+                    // Find users who have OWNER role on any team in this org
+                    LET has_owner_perm = (
+                        FOR perm IN {CollectionNames.PERMISSION.value}
+                            FILTER perm._from == user._id
+                            FILTER perm.role == "OWNER"
+                            FILTER perm.type == "USER"
+                            LIMIT 1
+                            RETURN 1
+                    )
+                    FILTER LENGTH(has_owner_perm) > 0
+                    RETURN DISTINCT user._key
+            """
+            admin_cursor = self.arango_service.db.aql.execute(
+                admin_users_query,
+                bind_vars={"org_id": org_id}
+            )
+            admin_users = list(admin_cursor)
+
+            # Create OWNER permission edges for admin users on the Default team
+            if admin_users:
+                admin_permission_edges = []
+                for admin_key in admin_users:
+                    admin_permission_edges.append({
+                        "_from": f"{CollectionNames.USERS.value}/{admin_key}",
+                        "_to": f"{CollectionNames.TEAMS.value}/{team_key}",
+                        "type": "USER",
+                        "role": "OWNER",
+                        "createdAtTimestamp": current_timestamp,
+                        "updatedAtTimestamp": current_timestamp,
+                    })
+
+                await self.arango_service.batch_create_edges(
+                    admin_permission_edges,
+                    CollectionNames.PERMISSION.value,
+                )
+                self.logger.info(f"✅ Created OWNER permissions for {len(admin_users)} admin user(s) on Default team")
 
             self.logger.info(f"✅ Created Default team for org {org_id}")
             return True
