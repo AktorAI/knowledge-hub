@@ -32,9 +32,23 @@ export const validateAzureAdUser = async (
       throw new BadRequestError('Error in Azure Auth CallBack');
     }
 
-    // Fetch OpenID Configuration & JWKS
+    // Extract token's tenant ID for multi-tenant support
+    // This allows tokens from personal accounts, guest accounts, and other organizations
+    const tokenTenantId = (decoded.payload as JwtPayload)?.tid as string | undefined;
+
+    // Use token's tenant for JWKS lookup (supports any Microsoft account)
+    // Fall back to configured tenant if token doesn't have tid
+    const jwksTenantId = tokenTenantId || tenantId;
+
+    logger.info('Token validation', {
+      configuredTenant: tenantId,
+      tokenTenant: tokenTenantId,
+      usingTenant: jwksTenantId,
+    });
+
+    // Fetch OpenID Configuration & JWKS using the token's tenant
     const openIdConfig = await axios.get(
-      `https://login.microsoftonline.com/${tenantId}/v2.0/.well-known/openid-configuration`,
+      `https://login.microsoftonline.com/${jwksTenantId}/v2.0/.well-known/openid-configuration`,
     );
 
     const jwks = await axios.get(openIdConfig.data.jwks_uri);

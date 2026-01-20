@@ -1181,12 +1181,16 @@ export class UserAccountController {
     credentials: Record<string, string>,
     ip: string,
     sessionEmail?: string,
+    orgId?: string,
   ) {
+    // For JIT-provisioned users, use orgId to create a temp user for config lookup
+    // The newly provisioned user may not have proper config bindings yet
+    const configUser = orgId ? { _id: 'temp', orgId } : user;
     const configManagerResponse =
       await this.configurationManagerService.getConfig(
         this.config.cmBackend,
         MICROSOFT_AUTH_CONFIG_PATH,
-        user,
+        configUser,
         this.config.scopedJwtSecret,
       );
     const { tenantId } = configManagerResponse.data;
@@ -1206,12 +1210,16 @@ export class UserAccountController {
     credentials: Record<string, string>,
     ip: string,
     sessionEmail?: string,
+    orgId?: string,
   ) {
+    // For JIT-provisioned users, use orgId to create a temp user for config lookup
+    // The newly provisioned user may not have proper config bindings yet
+    const configUser = orgId ? { _id: 'temp', orgId } : user;
     const configManagerResponse =
       await this.configurationManagerService.getConfig(
         this.config.cmBackend,
         AZURE_AD_AUTH_CONFIG_PATH,
-        user,
+        configUser,
         this.config.scopedJwtSecret,
       );
     const { tenantId } = configManagerResponse.data;
@@ -1459,7 +1467,7 @@ export class UserAccountController {
           await this.authenticateWithGoogle(user, credentials, req.ip!);
           break;
         case AuthMethodType.AZURE_AD:
-          await this.authenticateWithAzureAd(user, credentials, req.ip!, sessionInfo.email);
+          await this.authenticateWithAzureAd(user, credentials, req.ip!, sessionInfo.email, sessionInfo.orgId);
           break;
         case AuthMethodType.MICROSOFT:
           await this.authenticateWithMicrosoft(
@@ -1467,6 +1475,7 @@ export class UserAccountController {
             credentials,
             req.ip || ' ',
             sessionInfo.email,
+            sessionInfo.orgId,
           );
           break;
         case AuthMethodType.OAUTH:
