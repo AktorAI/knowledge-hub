@@ -15,6 +15,7 @@ import { AppConfig } from '../../tokens_manager/config/config';
 import { UserController } from '../../user_management/controller/users.controller';
 import { AuthService } from '../../user_management/services/auth.service';
 import { EntitiesEventProducer } from '../../user_management/services/entity_events.service';
+import { MailService as UserMailService } from '../../user_management/services/mail.service';
 
 const loggerConfig = {
   service: 'Auth Service Container',
@@ -99,10 +100,13 @@ export class AuthServiceContainer {
         .bind<EntitiesEventProducer>('EntitiesEventProducer')
         .toConstantValue(entityEventsService);
 
+      // Add UserMailService for UserController (different from auth MailService)
+      const userMailService = new UserMailService(appConfig, logger);
+
       // Add UserController for JIT provisioning in Microsoft OAuth
       const userController = new UserController(
         appConfig,
-        mailService,
+        userMailService,
         authService,
         logger,
         entityEventsService,

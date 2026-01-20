@@ -250,6 +250,7 @@ export function createSamlRouter(container: Container, userManagerContainer: Con
                 'ConfigurationManagerService',
               ),
               logger,
+              container.get<UserController>('UserController'),
             );
           });
         container
