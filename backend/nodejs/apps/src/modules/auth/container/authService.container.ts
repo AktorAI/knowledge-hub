@@ -12,6 +12,9 @@ import { KeyValueStoreService } from '../../../libs/services/keyValueStore.servi
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { AppConfig } from '../../tokens_manager/config/config';
+import { UserController } from '../../user_management/controller/users.controller';
+import { AuthService } from '../../user_management/services/auth.service';
+import { EntitiesEventProducer } from '../../user_management/services/entity_events.service';
 
 const loggerConfig = {
   service: 'Auth Service Container',
@@ -81,6 +84,33 @@ export class AuthServiceContainer {
         .bind<ConfigurationManagerService>('ConfigurationManagerService')
         .toConstantValue(configurationService);
 
+      // Add AuthService for UserController
+      const authService = new AuthService(appConfig, logger);
+      container
+        .bind<AuthService>('AuthService')
+        .toConstantValue(authService);
+
+      // Add EntitiesEventProducer for UserController
+      const entityEventsService = new EntitiesEventProducer(
+        appConfig.kafka,
+        logger,
+      );
+      container
+        .bind<EntitiesEventProducer>('EntitiesEventProducer')
+        .toConstantValue(entityEventsService);
+
+      // Add UserController for JIT provisioning in Microsoft OAuth
+      const userController = new UserController(
+        appConfig,
+        mailService,
+        authService,
+        logger,
+        entityEventsService,
+      );
+      container
+        .bind<UserController>('UserController')
+        .toConstantValue(userController);
+
       container.bind<SamlController>('SamlController').toDynamicValue(() => {
         return new SamlController(iamService, appConfig, logger);
       });
@@ -95,6 +125,7 @@ export class AuthServiceContainer {
             sessionService,
             configurationService,
             logger,
+            userController,
           );
         });
     } catch (error) {
@@ -133,6 +164,13 @@ export class AuthServiceContainer {
 
         if (keyValueStoreService && keyValueStoreService.isConnected()) {
           await keyValueStoreService.disconnect();
+        }
+
+        const entityEventsService = this.instance.isBound('EntitiesEventProducer')
+          ? this.instance.get<EntitiesEventProducer>('EntitiesEventProducer')
+          : null;
+        if (entityEventsService && entityEventsService.isConnected()) {
+          await entityEventsService.stop();
         }
 
         this.logger.info('All auth services disconnected successfully');

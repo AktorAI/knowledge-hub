@@ -133,10 +133,61 @@ class EntityEventService(BaseEventService):
                     f"✅ Successfully created organization: {payload['orgId']}"
                 )
 
+            # Create Default team for the organization
+            await self.__create_default_team(payload['orgId'])
+
             return True
 
         except Exception as e:
             self.logger.error(f"❌ Error creating organization: {str(e)}")
+            return False
+
+    async def __create_default_team(self, org_id: str) -> bool:
+        """
+        Create a Default team for the organization.
+        This team is used to automatically add new users during JIT provisioning.
+        The admin user (org creator) will be added as OWNER when the userAdded event is processed.
+        """
+        try:
+            current_timestamp = get_epoch_timestamp_in_ms()
+            team_key = str(uuid4())
+
+            # Check if Default team already exists
+            existing_query = f"""
+                FOR team IN {CollectionNames.TEAMS.value}
+                    FILTER team.orgId == @org_id AND team.name == 'Default'
+                    RETURN team
+            """
+            cursor = self.arango_service.db.aql.execute(
+                existing_query,
+                bind_vars={"org_id": org_id}
+            )
+            existing_teams = list(cursor)
+
+            if existing_teams:
+                self.logger.info(f"Default team already exists for org {org_id}")
+                return True
+
+            # Create the Default team
+            team_data = {
+                "_key": team_key,
+                "name": "Default",
+                "description": "Default team for all new users",
+                "orgId": org_id,
+                "createdAtTimestamp": current_timestamp,
+                "updatedAtTimestamp": current_timestamp,
+            }
+
+            await self.arango_service.batch_upsert_nodes(
+                [team_data],
+                CollectionNames.TEAMS.value,
+            )
+
+            self.logger.info(f"✅ Created Default team for org {org_id}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create Default team: {str(e)}")
             return False
 
     async def __handle_org_updated(self, payload: dict) -> bool:
@@ -272,6 +323,9 @@ class EntityEventService(BaseEventService):
                         },
                     )
 
+            # Add user to Default team with READER role (only if they have no existing team memberships)
+            await self.__add_user_to_default_team(user_data['_key'], payload['orgId'])
+
             self.logger.info(
                 f"✅ Successfully created/updated user: {payload['email']}"
             )
@@ -279,6 +333,78 @@ class EntityEventService(BaseEventService):
 
         except Exception as e:
             self.logger.error(f"❌ Error creating/updating user: {str(e)}")
+            return False
+
+    async def __add_user_to_default_team(self, user_key: str, org_id: str) -> bool:
+        """
+        Add user to the Default team with READER role.
+
+        IMPORTANT: Only adds user if they have NO existing team memberships.
+        This preserves permissions for pre-invited users who may already
+        have been assigned to specific teams before their first login.
+        """
+        try:
+            user_vertex = f"{CollectionNames.USERS.value}/{user_key}"
+
+            # Check if user already has ANY team memberships
+            existing_teams_query = f"""
+                FOR edge IN {CollectionNames.PERMISSION.value}
+                    FILTER edge._from == @user_vertex
+                    FILTER edge.type == "USER"
+                    FOR team IN {CollectionNames.TEAMS.value}
+                        FILTER team._id == edge._to
+                        FILTER team.orgId == @org_id
+                        RETURN team
+            """
+            cursor = self.arango_service.db.aql.execute(
+                existing_teams_query,
+                bind_vars={"user_vertex": user_vertex, "org_id": org_id}
+            )
+            existing_teams = list(cursor)
+
+            if existing_teams:
+                self.logger.info(
+                    f"User {user_key} already has {len(existing_teams)} team membership(s). "
+                    "Skipping Default team assignment to preserve existing permissions."
+                )
+                return False
+
+            # Find Default team for this org
+            query = f"""
+                FOR team IN {CollectionNames.TEAMS.value}
+                    FILTER team.orgId == @org_id AND team.name == 'Default'
+                    RETURN team
+            """
+            cursor = self.arango_service.db.aql.execute(query, bind_vars={"org_id": org_id})
+            teams = list(cursor)
+
+            if not teams:
+                self.logger.warning(f"Default team not found for org {org_id}")
+                return False
+
+            team = teams[0]
+            current_timestamp = get_epoch_timestamp_in_ms()
+
+            # Create permission edge for team membership
+            permission_edge = {
+                "_from": user_vertex,
+                "_to": f"{CollectionNames.TEAMS.value}/{team['_key']}",
+                "type": "USER",
+                "role": "READER",
+                "createdAtTimestamp": current_timestamp,
+                "updatedAtTimestamp": current_timestamp,
+            }
+
+            await self.arango_service.batch_create_edges(
+                [permission_edge],
+                CollectionNames.PERMISSION.value,
+            )
+
+            self.logger.info(f"✅ Added user {user_key} to Default team with READER role")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to add user to Default team: {str(e)}")
             return False
 
     async def __handle_user_updated(self, payload: dict) -> bool:

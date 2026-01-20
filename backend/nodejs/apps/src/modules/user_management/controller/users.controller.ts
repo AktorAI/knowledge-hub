@@ -338,6 +338,106 @@ export class UserController {
     return newUser.toObject();
   }
 
+  /**
+   * Just-In-Time user provisioning from Microsoft OAuth
+   * Creates user, adds to everyone group, and publishes creation event.
+   *
+   * IMPORTANT: This method is ONLY called for NEW users (not found in system).
+   * For pre-invited users or returning users, authentication proceeds normally
+   * without any modifications to existing group/team memberships.
+   */
+  async provisionMicrosoftUser(
+    email: string,
+    microsoftUser: Record<string, any>,
+    orgId: string,
+    logger: Logger,
+  ) {
+    logger.info('Auto-provisioning user from Microsoft OAuth', { email, orgId });
+
+    const userDetails = this.extractMicrosoftUserDetails(microsoftUser, email);
+    const newUser = new Users({
+      email,
+      ...userDetails,
+      orgId,
+      hasLoggedIn: false,
+      isDeleted: false,
+    });
+
+    await newUser.save();
+
+    // Add to everyone group
+    await UserGroups.updateOne(
+      { orgId, type: 'everyone', isDeleted: false },
+      { $addToSet: { users: newUser._id } },
+    );
+
+    // Publish user creation event (triggers ArangoDB sync + Default team assignment)
+    try {
+      await this.eventService.start();
+      await this.eventService.publishEvent({
+        eventType: EventType.NewUserEvent,
+        timestamp: Date.now(),
+        payload: {
+          orgId: orgId.toString(),
+          userId: newUser._id,
+          fullName: newUser.fullName,
+          email: newUser.email,
+          syncAction: SyncAction.Immediate,
+        } as UserAddedEvent,
+      });
+    } catch (eventError) {
+      logger.error('Failed to publish user creation event', {
+        error: eventError,
+        userId: newUser._id,
+      });
+    } finally {
+      await this.eventService.stop();
+    }
+
+    logger.info('Microsoft OAuth user auto-provisioned successfully', {
+      userId: newUser._id,
+      email,
+    });
+
+    return newUser.toObject();
+  }
+
+  /**
+   * Extract user details from Microsoft OAuth token with fallbacks for different claim formats
+   */
+  private extractMicrosoftUserDetails(microsoftUser: Record<string, any>, email: string) {
+    // Try multiple claim names for first name
+    const firstName =
+      microsoftUser.givenName ||
+      microsoftUser.given_name ||
+      microsoftUser.firstName;
+
+    // Try multiple claim names for last name
+    const lastName =
+      microsoftUser.surname ||
+      microsoftUser.family_name ||
+      microsoftUser.lastName ||
+      microsoftUser.sn;
+
+    // Try multiple claim names for display name
+    const displayName =
+      microsoftUser.displayName ||
+      microsoftUser.name ||
+      microsoftUser.fullName;
+
+    // Construct full name with fallbacks
+    const fullName =
+      displayName ||
+      [firstName, lastName].filter(Boolean).join(' ') ||
+      email.split('@')[0];
+
+    return {
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      fullName,
+    };
+  }
+
   async updateUser(
     req: AuthenticatedUserRequest,
     res: Response,

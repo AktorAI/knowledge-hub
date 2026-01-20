@@ -56,6 +56,7 @@ import {
 import { AppConfig } from '../../tokens_manager/config/config';
 import { Org } from '../../user_management/schema/org.schema';
 import { verifyTurnstileToken } from '../../../libs/utils/turnstile-verification';
+import { UserController } from '../../user_management/controller/users.controller';
 
 const {
   LOGIN,
@@ -78,6 +79,7 @@ export class UserAccountController {
     @inject('ConfigurationManagerService')
     private configurationManagerService: ConfigurationManagerService,
     @inject('Logger') private logger: Logger,
+    @inject('UserController') private userController: UserController,
   ) {}
   async generateHashedOTP() {
     const otp = generateOtp();
@@ -1269,10 +1271,50 @@ export class UserAccountController {
         sessionInfo.email,
         authToken,
       );
+
+      let user;
       if (!userFindResult) {
-        throw new NotFoundError('User not found');
+        // JIT Provisioning for Microsoft OAuth - ONLY for NEW users
+        if (method === AuthMethodType.MICROSOFT) {
+          this.logger.info('User not found, initiating JIT provisioning for Microsoft OAuth', {
+            email: sessionInfo.email,
+          });
+
+          // Decode the idToken to extract user details for provisioning
+          const idToken = credentials?.idToken;
+          let microsoftUserDetails: Record<string, any> = {};
+          if (idToken) {
+            const decoded = jwt.decode(idToken) as Record<string, any>;
+            if (decoded) {
+              microsoftUserDetails = {
+                givenName: decoded.given_name || decoded.givenName,
+                surname: decoded.family_name || decoded.surname,
+                displayName: decoded.name || decoded.displayName,
+                email: decoded.email || decoded.preferred_username,
+              };
+            }
+          }
+
+          // Provision the new user
+          user = await this.userController.provisionMicrosoftUser(
+            sessionInfo.email,
+            microsoftUserDetails,
+            sessionInfo.orgId,
+            this.logger,
+          );
+
+          this.logger.info('JIT provisioning completed for Microsoft OAuth user', {
+            email: sessionInfo.email,
+            userId: user._id,
+          });
+        } else {
+          throw new NotFoundError('User not found');
+        }
+      } else {
+        // EXISTING USER: Proceed with normal login
+        // NO modifications to groups or team memberships
+        user = userFindResult.data;
       }
-      const user = userFindResult.data;
 
       this.logger.debug('method', method);
       switch (method) {
