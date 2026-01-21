@@ -9,8 +9,8 @@ export async function generateAuthToken(
   user: Record<string, any>,
   jwtSecret: string,
 ) {
-  // look up for
-  const org = await Org.findOne({ orgId: user.orgId, isDeleted: false });
+  // Look up org by _id (user.orgId references org._id, not a separate orgId field)
+  const org = await Org.findOne({ _id: user.orgId, isDeleted: false });
   if (!org) {
     throw new NotFoundError('Organization not found');
   }
