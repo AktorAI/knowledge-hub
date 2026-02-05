@@ -41,8 +41,51 @@ async def create_team(request: Request) -> JSONResponse:
         "orgId": request.state.user.get("orgId"),
     }
     user = await arango_service.get_user_by_user_id(user_info.get("userId"))
+
+    # If user not found in ArangoDB (e.g., during org creation before Kafka sync),
+    # create minimal org and user records to allow team creation
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        logger.info(f"User not found in ArangoDB, creating minimal records for team creation: {user_info}")
+        current_timestamp = get_epoch_timestamp_in_ms()
+        org_id = user_info.get("orgId")
+        user_key = user_info.get("userId")
+
+        # Check if org exists, create minimal record if not
+        org = await arango_service.get_document(org_id, CollectionNames.ORGS.value)
+        if not org:
+            logger.info(f"Org not found in ArangoDB, creating minimal record: {org_id}")
+            minimal_org = {
+                "_key": org_id,
+                "name": body_dict.get("orgName", "Organization"),
+                "accountType": "ENTERPRISE",
+                "isActive": True,
+                "createdAtTimestamp": current_timestamp,
+                "updatedAtTimestamp": current_timestamp,
+            }
+            await arango_service.batch_upsert_nodes([minimal_org], CollectionNames.ORGS.value)
+
+        # Create minimal user record
+        minimal_user = {
+            "_key": user_key,
+            "userId": user_info.get("userId"),
+            "orgId": org_id,
+            "isActive": True,
+            "createdAtTimestamp": current_timestamp,
+            "updatedAtTimestamp": current_timestamp,
+        }
+        await arango_service.batch_upsert_nodes([minimal_user], CollectionNames.USERS.value)
+
+        # Create org-user edge
+        org_user_edge = {
+            "_to": f"{CollectionNames.ORGS.value}/{org_id}",
+            "_from": f"{CollectionNames.USERS.value}/{user_key}",
+            "entityType": "ORGANIZATION",
+            "createdAtTimestamp": current_timestamp,
+        }
+        await arango_service.batch_create_edges([org_user_edge], CollectionNames.BELONGS_TO.value)
+
+        user = {"_key": user_key}
+
     # Generate a unique key for the team
     team_key = str(uuid.uuid4())
 

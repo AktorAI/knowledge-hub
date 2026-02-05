@@ -6,10 +6,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from html_to_markdown import convert
 
-from app.config.constants.ai_models import (
-    AzureDocIntelligenceModel,
-    OCRProvider,
-)
+from app.config.constants.ai_models import AzureDocIntelligenceModel, OCRProvider
 from app.config.constants.arangodb import (
     CollectionNames,
     Connectors,
@@ -23,10 +20,12 @@ from app.models.blocks import (
     Block,
     BlockContainerIndex,
     BlockGroup,
+    BlockGroupChildren,
     BlocksContainer,
     BlockType,
     CitationMetadata,
     DataFormat,
+    GroupType,
     Point,
 )
 from app.models.entities import Record, RecordType
@@ -417,11 +416,13 @@ class Processor:
                                 block_group.parent_index = block_group.parent_index + block_group_index_offset
                             # Adjust children indices
                             if block_group.children:
-                                for child in block_group.children:
-                                    if child.block_index is not None:
-                                        child.block_index = child.block_index + block_index_offset
-                                    if child.block_group_index is not None:
-                                        child.block_group_index = child.block_group_index + block_group_index_offset
+                                # Adjust ranges by adding offsets
+                                for range_obj in block_group.children.block_ranges:
+                                    range_obj.start += block_index_offset
+                                    range_obj.end += block_index_offset
+                                for range_obj in block_group.children.block_group_ranges:
+                                    range_obj.start += block_group_index_offset
+                                    range_obj.end += block_group_index_offset
                             all_block_groups.append(block_group)
 
                         block_index_offset = len(all_blocks)
@@ -502,7 +503,13 @@ class Processor:
 
             block_groups = ocr_result.get("tables", [])
             for block_group in block_groups:
-                block_group.children = table_rows.get(block_group.index, [])
+                # Convert list of BlockContainerIndex to BlockGroupChildren
+                block_container_indices = table_rows.get(block_group.index, [])
+                if block_container_indices:
+                    block_indices = [child.block_index for child in block_container_indices if child.block_index is not None]
+                    block_group.children = BlockGroupChildren.from_indices(block_indices=block_indices)
+                else:
+                    block_group.children = None
             record = await self.arango_service.get_document(
                 recordId, CollectionNames.RECORDS.value
             )
@@ -603,6 +610,152 @@ class Processor:
             self.logger.error(f"❌ Error processing DOCX document: {str(e)}")
             raise
 
+    async def _enhance_tables_with_llm(self, block_containers: BlocksContainer) -> None:
+        """
+        Enhance TABLE BlockGroups with LLM-generated summaries and row descriptions.
+
+        This method processes all TABLE BlockGroups in the container:
+        - Generates table summary and enhanced column headers using LLM
+        - Generates natural language descriptions for each row
+        - Updates BlockGroup and Block data with enhanced content
+
+        Args:
+            block_containers: The BlocksContainer to enhance in-place
+        """
+        from app.utils.indexing_helpers import (
+            get_rows_text,
+            get_table_summary_n_headers,
+        )
+
+        # Find all TABLE BlockGroups
+        table_groups = [
+            bg for bg in block_containers.block_groups
+            if bg.type == GroupType.TABLE
+        ]
+
+        if not table_groups:
+            self.logger.debug("No TABLE BlockGroups found, skipping LLM enhancement")
+            return
+
+        self.logger.info(f"🤖 Enhancing {len(table_groups)} tables with LLM summaries")
+
+        for table_group in table_groups:
+            try:
+                # Get table markdown from data
+                table_markdown = table_group.data.get("table_markdown") if table_group.data else None
+                if not table_markdown:
+                    self.logger.warning(f"No table_markdown found for table group {table_group.index}")
+                    continue
+
+                # Get LLM-enhanced summary and column headers
+                response = await get_table_summary_n_headers(self.config_service, table_markdown)
+
+                if response:
+                    table_summary = response.summary or ""
+                    column_headers = response.headers or []
+
+                    # Update BlockGroup with enhanced data
+                    table_group.description = table_summary
+                    if table_group.data is None:
+                        table_group.data = {}
+                    table_group.data["table_summary"] = table_summary
+                    table_group.data["column_headers"] = column_headers
+
+                    # Update TableMetadata if column headers are available
+                    if column_headers and table_group.table_metadata:
+                        table_group.table_metadata.column_names = column_headers
+
+                    self.logger.debug(f"Enhanced table {table_group.index} with summary: {table_summary[:100]}...")
+
+                    # Get all child row blocks for this table
+                    row_blocks = []
+                    row_dicts = []
+
+                    if table_group.children:
+                        # Handle new BlockGroupChildren format (range-based)
+                        if isinstance(table_group.children, BlockGroupChildren):
+                            # Iterate over block ranges and expand to individual indices
+                            for range_obj in table_group.children.block_ranges:
+                                for block_index in range(range_obj.start, range_obj.end + 1):
+                                    if 0 <= block_index < len(block_containers.blocks):
+                                        block = block_containers.blocks[block_index]
+                                        if block.type == BlockType.TABLE_ROW:
+                                            row_blocks.append(block)
+                                            # Extract row dict from block data
+                                            if block.data and "cells" in block.data:
+                                                # Create row dict mapping column headers to cell values
+                                                cells = block.data["cells"]
+                                                if isinstance(cells, list) and column_headers:
+                                                    row_dict = {
+                                                        col: cells[i] if i < len(cells) else ""
+                                                        for i, col in enumerate(column_headers)
+                                                    }
+                                                    row_dicts.append(row_dict)
+                                                else:
+                                                    row_dicts.append({})
+                        # Handle old format (list of BlockContainerIndex) for backward compatibility
+                        elif isinstance(table_group.children, list):
+                            for child_idx in table_group.children:
+                                if isinstance(child_idx, BlockContainerIndex) and child_idx.block_index is not None:
+                                    block_index = child_idx.block_index
+                                    if 0 <= block_index < len(block_containers.blocks):
+                                        block = block_containers.blocks[block_index]
+                                        if block.type == BlockType.TABLE_ROW:
+                                            row_blocks.append(block)
+                                            # Extract row dict from block data
+                                            if block.data and "cells" in block.data:
+                                                # Create row dict mapping column headers to cell values
+                                                cells = block.data["cells"]
+                                                if isinstance(cells, list) and column_headers:
+                                                    row_dict = {
+                                                        col: cells[i] if i < len(cells) else ""
+                                                        for i, col in enumerate(column_headers)
+                                                    }
+                                                    row_dicts.append(row_dict)
+                                                else:
+                                                    row_dicts.append({})
+
+                    # Generate LLM row descriptions (skip header rows)
+                    # Filter out header rows using is_header flag from table_row_metadata
+                    non_header_row_dicts = []
+                    non_header_row_indices = []  # Track original indices for updating blocks
+
+                    for i, (row_dict, row_block) in enumerate(zip(row_dicts, row_blocks)):
+                        # Check if this row is a header using the is_header flag from table_row_metadata
+                        is_header = (
+                            row_block
+                            and row_block.table_row_metadata
+                            and row_block.table_row_metadata.is_header
+                        )
+
+                        if not is_header:
+                            non_header_row_dicts.append(row_dict)
+                            non_header_row_indices.append(i)
+
+                    if non_header_row_dicts:
+                        try:
+                            table_data = {"grid": [[row] for row in non_header_row_dicts]}
+                            row_descriptions, _ = await get_rows_text(
+                                self.config_service, table_data, table_summary, column_headers
+                            )
+
+                            # Update row blocks with LLM descriptions (only non-header rows)
+                            for description_idx, original_idx in enumerate(non_header_row_indices):
+                                if description_idx < len(row_descriptions) and original_idx < len(row_blocks):
+                                    row_block = row_blocks[original_idx]
+                                    if row_block.data:
+                                        row_block.data["row_natural_language_text"] = row_descriptions[description_idx]
+
+                            self.logger.debug(f"Enhanced {len(row_descriptions)} rows with LLM descriptions")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to generate row descriptions: {e}")
+                else:
+                    self.logger.warning(f"No LLM response for table {table_group.index}")
+
+            except Exception as e:
+                self.logger.error(f"Error enhancing table {table_group.index}: {e}")
+                # Continue with other tables even if one fails
+
     async def process_blocks(
         self, recordName, recordId, version, source, orgId, blocks_data, virtual_record_id
     ) -> AsyncGenerator[Dict[str, Any], None]:
@@ -646,6 +799,9 @@ class Processor:
 
             # Signal parsing complete after blocks are processed
             yield {"event": "parsing_complete", "data": {"record_id": recordId}}
+
+            # Enhance TABLE BlockGroups with LLM summaries and row descriptions
+            await self._enhance_tables_with_llm(block_containers)
 
             # Get record from database
             record = await self.arango_service.get_document(
@@ -889,13 +1045,19 @@ class Processor:
         """
         Build the final BlocksContainer with updated indices.
 
+        Handles both:
+        - BlockGroups with requires_processing=True: blocks from docling processing
+        - BlockGroups with requires_processing=False: existing blocks from connector
+
+        All blocks are assigned sequential indices in BlockGroup order.
+
         Args:
             block_containers: Original BlocksContainer
             block_groups_with_index: Block groups with valid indices
             block_groups_without_index: Block groups without indices
             processing_results: Map of parent_index -> (new_block_groups, new_blocks)
             index_shift_map: Map of original_index to shift amount
-            initial_block_count: Initial count of blocks
+            initial_block_count: Initial count of blocks (unused, kept for compatibility)
 
         Returns:
             New BlocksContainer with processed blocks merged in
@@ -904,10 +1066,26 @@ class Processor:
         new_blocks: List[Block] = []
         processed_indices = set(processing_results.keys())
 
-        # Track block index offset (blocks are appended at the end)
-        block_index_offset = initial_block_count
+        # Group existing blocks by their original parent_index
+        # (before any shifting is applied to BlockGroup indices)
+        existing_blocks_by_parent: Dict[int, List[Block]] = {}
+        for block in block_containers.blocks:
+            parent_idx = block.parent_index
+            if parent_idx is not None:
+                if parent_idx not in existing_blocks_by_parent:
+                    existing_blocks_by_parent[parent_idx] = []
+                existing_blocks_by_parent[parent_idx].append(block)
 
-        # Build new block_groups list
+        # Sort blocks within each parent group by their original index to maintain relative order
+        for parent_idx in existing_blocks_by_parent:
+            existing_blocks_by_parent[parent_idx].sort(
+                key=lambda b: b.index if b.index is not None else float('inf')
+            )
+
+        # Track current block index for sequential assignment
+        current_block_index = 0
+
+        # Build new block_groups list and assign block indices in BlockGroup order
         for bg in block_groups_with_index:
             original_index = bg.index
             shift_amount = index_shift_map[original_index]
@@ -920,55 +1098,45 @@ class Processor:
             if bg.parent_index is not None and bg.parent_index in index_shift_map:
                 bg.parent_index += index_shift_map[bg.parent_index]
 
-            # Update children references
-            if bg.children:
-                for child in bg.children:
-                    if child.block_group_index is not None and child.block_group_index in index_shift_map:
-                        child.block_group_index += index_shift_map[child.block_group_index]
+            # Update children.block_group_ranges references
+            if bg.children and bg.children.block_group_ranges:
+                shifted_indices = []
+                for range_obj in bg.children.block_group_ranges:
+                    for idx in range(range_obj.start, range_obj.end + 1):
+                        if idx in index_shift_map:
+                            shifted_indices.append(idx + index_shift_map[idx])
+                        else:
+                            shifted_indices.append(idx)
+                # Reconstruct ranges from shifted indices
+                bg.children.block_group_ranges = BlockGroupChildren.from_indices(
+                    block_group_indices=shifted_indices
+                ).block_group_ranges
 
             # Add the block_group to the result
             new_block_groups.append(bg)
 
-            # If this block_group was processed, insert its children and mark as processed
+            # Handle blocks for this BlockGroup
             if original_index in processed_indices:
+                # Case 1: BlockGroup was processed by docling - use new blocks
                 bg.requires_processing = False
 
                 # Get processing results
                 new_block_groups_list, new_blocks_list = processing_results[original_index]
                 insertion_index = final_index + 1
 
-                # Initialize children array if needed
+                # Initialize children if needed
                 if bg.children is None:
-                    bg.children = []
+                    bg.children = BlockGroupChildren()
 
-                # Assign indices to new block_groups and update references
-                for i, new_bg in enumerate(new_block_groups_list):
-                    new_bg.index = insertion_index + i
+                # Clear existing block_ranges since we're replacing with processed blocks
+                bg.children.block_ranges = []
 
-                    # Set parent_index to parent's final index if not set
-                    if new_bg.parent_index is None:
-                        new_bg.parent_index = final_index
-                    else:
-                        # If parent_index exists, it's a relative index from docling
-                        new_bg.parent_index = new_bg.parent_index + insertion_index
-
-                    # Update children indices in the new block_group
-                    if new_bg.children:
-                        for child in new_bg.children:
-                            if child.block_index is not None:
-                                child.block_index += block_index_offset
-                            if child.block_group_index is not None:
-                                child.block_group_index += insertion_index
-
-                    new_block_groups.append(new_bg)
-
-                    # Add to parent's children
-                    bg.children.append(BlockContainerIndex(block_group_index=new_bg.index))
-
-                # Process new blocks with sequential indices
-                for block_i, new_block in enumerate(new_blocks_list):
+                # First, assign indices to all blocks (docling gives proper order)
+                # This ensures we know the final indices before updating nested block_group ranges
+                block_start_index = current_block_index
+                for new_block in new_blocks_list:
                     # Assign sequential block index
-                    new_block.index = block_index_offset + block_i
+                    new_block.index = current_block_index
 
                     # Set parent_index
                     if new_block.parent_index is None:
@@ -981,23 +1149,83 @@ class Processor:
 
                     # Add blocks that directly belong to the parent BlockGroup
                     if new_block.parent_index == final_index:
-                        bg.children.append(BlockContainerIndex(block_index=new_block.index))
+                        bg.children.add_block_index(new_block.index)
 
-                # Update block offset for next iteration
-                block_index_offset += len(new_blocks_list)
+                    current_block_index += 1
+
+                # Now assign indices to new block_groups and update their ranges
+                # (ranges can now reference the correctly assigned block indices)
+                for i, new_bg in enumerate(new_block_groups_list):
+                    new_bg.index = insertion_index + i
+
+                    # Set parent_index to parent's final index if not set
+                    if new_bg.parent_index is None:
+                        new_bg.parent_index = final_index
+                    else:
+                        # If parent_index exists, it's a relative index from docling
+                        new_bg.parent_index = new_bg.parent_index + insertion_index
+
+                    # Update children indices in the new block_group
+                    # Since blocks are already assigned, shift ranges by block_start_index
+                    if new_bg.children:
+                        # Shift block_ranges (docling returns ranges relative to its output starting at 0)
+                        for range_obj in new_bg.children.block_ranges:
+                            range_obj.start += block_start_index
+                            range_obj.end += block_start_index
+
+                        # Shift block_group_ranges
+                        for range_obj in new_bg.children.block_group_ranges:
+                            range_obj.start += insertion_index
+                            range_obj.end += insertion_index
+
+                    new_block_groups.append(new_bg)
+
+                    # Add to parent's children
+                    bg.children.add_block_group_index(new_bg.index)
+
+            elif original_index in existing_blocks_by_parent:
+                # Case 2: BlockGroup has existing blocks from connector - reassign indices
+                existing_blocks = existing_blocks_by_parent[original_index]
+
+                # Initialize children if needed
+                if bg.children is None:
+                    bg.children = BlockGroupChildren()
+
+                # Clear and rebuild block_ranges with new indices
+                bg.children.block_ranges = []
+
+                for block in existing_blocks:
+                    # Update parent_index to the shifted BlockGroup index
+                    block.parent_index = final_index
+
+                    # Assign new sequential block index
+                    block.index = current_block_index
+                    new_blocks.append(block)
+
+                    # Add to parent's children
+                    bg.children.add_block_index(block.index)
+
+                    current_block_index += 1
 
         # Append block_groups with None index at end
         new_block_groups.extend(block_groups_without_index)
 
-        # Update all original blocks' parent_index references
-        for block in block_containers.blocks:
-            if block.parent_index is not None and block.parent_index in index_shift_map:
-                block.parent_index += index_shift_map[block.parent_index]
+        # Sort block_groups by index to ensure list position matches index value
+        sorted_block_groups = sorted(
+            new_block_groups,
+            key=lambda bg: bg.index if bg.index is not None else float('inf')
+        )
+
+        # Sort blocks by index to ensure list position matches index value
+        sorted_blocks = sorted(
+            new_blocks,
+            key=lambda b: b.index if b.index is not None else float('inf')
+        )
 
         # Build final BlocksContainer
         return BlocksContainer(
-            block_groups=new_block_groups,
-            blocks=list(block_containers.blocks) + new_blocks
+            block_groups=sorted_block_groups,
+            blocks=sorted_blocks
         )
 
     async def _process_blockgroups_through_docling(

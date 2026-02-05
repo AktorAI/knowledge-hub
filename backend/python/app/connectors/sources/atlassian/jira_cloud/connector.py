@@ -65,8 +65,8 @@ from app.connectors.sources.atlassian.core.oauth import (
 from app.connectors.utils.value_mapper import ValueMapper, map_relationship_type
 from app.models.blocks import (
     Block,
-    BlockContainerIndex,
     BlockGroup,
+    BlockGroupChildren,
     BlocksContainer,
     ChildRecord,
     ChildType,
@@ -2374,16 +2374,27 @@ class JiraConnector(BaseConnector):
         # Read project sync point
         project_sync_data = await self._get_project_sync_checkpoint(project_key)
 
+        # Check if this is a new project (no checkpoint exists)
+        is_new_project = not project_sync_data or (
+            not project_sync_data.get("last_issue_updated") and
+            not project_sync_data.get("last_sync_time")
+        )
+
         # Use last_issue_updated if available (works for both resume and incremental sync)
-        # Fall back to project sync time, then global sync time
-        resume_from_timestamp = project_sync_data.get("last_issue_updated")
-        if not resume_from_timestamp:
-            resume_from_timestamp = project_sync_data.get("last_sync_time") or global_last_sync_time
+        # For new projects, don't use any timestamp to fetch ALL issues
+        # Fall back to project sync time, then global sync time (only for existing projects)
+        resume_from_timestamp = None
+        if not is_new_project:
+            resume_from_timestamp = project_sync_data.get("last_issue_updated")
+            if not resume_from_timestamp:
+                resume_from_timestamp = project_sync_data.get("last_sync_time") or global_last_sync_time
 
         # Set project_last_sync_time for fallback in _fetch_issues_batched
-        project_last_sync_time = project_sync_data.get("last_sync_time") or global_last_sync_time
+        project_last_sync_time = project_sync_data.get("last_sync_time") or global_last_sync_time if not is_new_project else None
 
-        if resume_from_timestamp:
+        if is_new_project:
+            self.logger.info(f"🆕 New project detected: {project_key}. Fetching ALL issues (no timestamp filter).")
+        elif resume_from_timestamp:
             self.logger.info(f"🔄 Starting sync for project {project_key} from timestamp {resume_from_timestamp}")
 
         # Fetch and process issues in batches
@@ -3603,23 +3614,25 @@ class JiraConnector(BaseConnector):
             if b.parent_index is not None:
                 block_children_map[b.parent_index].append(b.index)
 
-        # Now populate the children arrays
+        # Now populate the children arrays using range-based structure
         for bg in block_groups:
-            children_list: List[BlockContainerIndex] = []
+            child_block_indices = []
+            child_bg_indices = []
 
             # Add child BlockGroups
             if bg.index in blockgroup_children_map:
-                for child_bg_index in sorted(blockgroup_children_map[bg.index]):
-                    children_list.append(BlockContainerIndex(block_group_index=child_bg_index))
+                child_bg_indices = sorted(blockgroup_children_map[bg.index])
 
             # Add child Blocks
             if bg.index in block_children_map:
-                for child_block_index in sorted(block_children_map[bg.index]):
-                    children_list.append(BlockContainerIndex(block_index=child_block_index))
+                child_block_indices = sorted(block_children_map[bg.index])
 
             # Set children if we have any
-            if children_list:
-                bg.children = children_list
+            if child_block_indices or child_bg_indices:
+                bg.children = BlockGroupChildren.from_indices(
+                    block_indices=child_block_indices,
+                    block_group_indices=child_bg_indices
+                )
 
         return BlocksContainer(blocks=blocks, block_groups=block_groups)
 

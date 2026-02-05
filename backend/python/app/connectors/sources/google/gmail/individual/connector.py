@@ -1370,7 +1370,6 @@ class GoogleGmailIndividualConnector(BaseConnector):
         """
         # Check if file_id is a Drive file ID (no tilde, typically longer alphanumeric)
         # Drive file IDs don't contain tildes, while our stable IDs use messageId~partId format
-        print(f"\n\n\n\n\nfile_id: {file_id}")
         is_drive_file = "~" not in file_id
 
         if is_drive_file:
@@ -1573,7 +1572,7 @@ class GoogleGmailIndividualConnector(BaseConnector):
                 email=email_address,
                 full_name=email_address,  # Gmail profile doesn't provide display name
                 source_user_id=email_address,
-                app_name=Connectors.GOOGLE_MAIL.value,
+                app_name=self.connector_name,
                 connector_id=self.connector_id
             )
             await self.data_entities_processor.on_new_app_users([user])
