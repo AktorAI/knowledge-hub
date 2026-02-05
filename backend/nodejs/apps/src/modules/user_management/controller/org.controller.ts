@@ -299,6 +299,16 @@ export class OrgController {
         });
       }
 
+      // Create Global Reader team for the new organization BEFORE publishing user events
+      // This ensures the team exists when Python backend processes the user event
+      await this.globalReaderTeamService.ensureGlobalReaderTeamExists(
+        org._id.toString(),
+        adminUser._id.toString(),
+        {
+          'Content-Type': 'application/json',
+        },
+      );
+
       await this.eventService.start();
       let event: Event = {
         eventType: EventType.OrgCreatedEvent,
@@ -326,16 +336,6 @@ export class OrgController {
       await this.eventService.publishEvent(event);
 
       await this.eventService.stop();
-
-      // Create Global Reader team for the new organization
-      // This is non-blocking - errors are logged but don't fail org creation
-      await this.globalReaderTeamService.ensureGlobalReaderTeamExists(
-        org._id.toString(),
-        adminUser._id.toString(),
-        {
-          'Content-Type': 'application/json',
-        },
-      );
 
       res.status(200).json(org);
     } catch (error) {
