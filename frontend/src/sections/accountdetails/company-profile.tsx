@@ -388,7 +388,7 @@ export default function CompanyProfile() {
                     </Grid>
                     <Grid item xs={12} sm={6}>
                       <Tooltip
-                        title="The name of the company to display within Pipeshub"
+                        title="The name of the company to display within Knowledge Tool"
                         arrow
                         placement="top-start"
                       >
