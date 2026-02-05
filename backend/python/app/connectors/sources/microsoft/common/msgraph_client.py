@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass
 from logging import Logger
 from typing import Any, Callable, Dict, List, Optional
@@ -288,6 +289,37 @@ class MSGraphClient:
             self.logger.warning(f"Could not fetch details for user {user_id}: {ex}")
             return None
 
+    async def get_user_info(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetches user information (email and display name) by user ID.
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            Dict with 'email' and 'display_name' keys, or None if user not found
+        """
+        try:
+            async with self.rate_limiter:
+                query_params = UsersRequestBuilder.UsersRequestBuilderGetQueryParameters(
+                    select=['id', 'mail', 'userPrincipalName', 'displayName']
+                )
+                request_configuration = RequestConfiguration(
+                    query_parameters=query_params
+                )
+
+                user = await self.client.users.by_user_id(user_id).get(request_configuration)
+
+                if user:
+                    return {
+                        'email': user.mail or user.user_principal_name,
+                        'display_name': user.display_name
+                    }
+            return None
+        except Exception as ex:
+            self.logger.warning(f"Could not fetch user info for {user_id}: {ex}")
+            return None
+
     async def get_user_drive(self, user_id: str) -> Optional[Drive]:
         """
         Check if a user has a OneDrive drive provisioned.
@@ -554,24 +586,29 @@ class MSGraphClient:
     ) -> dict:
         """
         Raw Search via MS Graph. Returns the raw response object/dict.
+        Automatically detects region from error and retries if region is invalid.
         """
-        try:
+
+        if region is None:
+            region = "NAM"
+
+        async def _execute_search(search_region: str) -> dict:
             offset = (page - 1) * limit
-            search_query = query.strip() if query and query.strip() else "*"
+            search_query_str = query.strip() if query and query.strip() else "*"
 
             search_request = {
                 "requests": [
                     {
                         "entityTypes": entity_types,
-                        "query": {"queryString": search_query},
+                        "query": {"queryString": search_query_str},
                         "from": offset,
                         "size": limit,
-                        "region": region,
-                        # distinct_fields can be requested here if needed
-                        # "fields": ["ListTitle", "title", "path"]
                     }
                 ]
             }
+
+            if search_region:
+                search_request["requests"][0]["region"] = search_region
 
             async with self.rate_limiter:
                 request_info = RequestInformation(Method.POST, "https://graph.microsoft.com/v1.0/search/query")
@@ -589,9 +626,53 @@ class MSGraphClient:
                     error_map=error_mapping
                 )
 
-                # Return the raw result directly
                 return result
 
-        except Exception as ex:
+        def _extract_region_from_error(error: ODataError) -> Optional[str]:
+            """
+            Extract valid region from error message.
+            Example: 'Requested region  not found. Only valid regions are NAM.'
+            Example: 'Requested region  not found. Only valid regions are NAM, EUR, APC.'
+            """
+            try:
+                if error.error and error.error.message:
+                    message = error.error.message
+
+                    pattern = r"Only valid regions are ([A-Z,\s]+)\."
+                    match = re.search(pattern, message)
+
+                    if match:
+                        regions_str = match.group(1)
+                        regions = [r.strip() for r in regions_str.split(',') if r.strip()]
+                        if regions:
+                            return regions[0]
+            except Exception:
+                pass
+            return None
+
+        try:
+            return await _execute_search(region or "")
+
+        except ODataError as ex:
+            # Check if this is a region-related error
+            if ex.error and ex.error.code == 'BadRequest' and ex.error.message:
+                if 'valid regions are' in ex.error.message.lower():
+                    extracted_region = _extract_region_from_error(ex)
+
+                    if extracted_region:
+                        # Only retry if extracted region is different from what was passed
+                        if extracted_region != region:
+                            self.logger.info(
+                                f"Invalid region '{region or ''}'. "
+                                f"Detected valid region: {extracted_region}. Retrying."
+                            )
+                            return await _execute_search(extracted_region)
+                        else:
+                            # Same region was extracted - something else is wrong
+                            self.logger.error(
+                                f"Region '{region}' was passed but still failed. "
+                                f"Error: {ex.error.message}"
+                            )
+
             self.logger.error(f"Error searching entities {entity_types}: {ex}")
             raise

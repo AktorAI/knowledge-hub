@@ -155,6 +155,7 @@ class DataSourceEntitiesProcessor:
             "connector_id": record.connector_id,
             "record_type": parent_record_type,
             "record_group_type": record.record_group_type,
+            "external_record_group_id": record.external_record_group_id,  # Inherit from child record
             "version": 0,
             "mime_type": MimeTypes.UNKNOWN.value,
             "source_created_at": 0,  # Will be updated when real parent is synced
@@ -166,7 +167,6 @@ class DataSourceEntitiesProcessor:
             file_params = {k: v for k, v in base_params.items() if k != "mime_type"}
             return FileRecord(
                 **file_params,
-                external_record_group_id=record.external_record_group_id,
                 is_file=False,
                 extension=None,
                 mime_type=MimeTypes.FOLDER.value,
@@ -217,7 +217,15 @@ class DataSourceEntitiesProcessor:
                     record=record,
                 )
                 self.logger.debug(f"parent_record: {parent_record}")
+
+                # Prepare record group BEFORE saving (so record_group_id is included in first save)
+                record_group_id = await self._handle_record_group(parent_record, tx_store)
+
                 await tx_store.batch_upsert_records([parent_record])
+
+                # Link record to group AFTER saving (when record.id is available for edges)
+                if record_group_id:
+                    await self._link_record_to_group(parent_record, record_group_id, tx_store)
 
             if parent_record and isinstance(parent_record, Record):
                 if (record.record_type == RecordType.FILE and record.parent_external_record_id and
@@ -294,7 +302,15 @@ class DataSourceEntitiesProcessor:
                     parent_record_type=record_type,
                     record=record,
                 )
+
+                # Prepare record group BEFORE saving (so record_group_id is included in first save)
+                record_group_id = await self._handle_record_group(related_record, tx_store)
+
                 await tx_store.batch_upsert_records([related_record])
+
+                # Link record to group AFTER saving (when record.id is available for edges)
+                if record_group_id:
+                    await self._link_record_to_group(related_record, record_group_id, tx_store)
 
             # Create relation using the specific relation_type
             if related_record and isinstance(related_record, Record):
@@ -315,6 +331,7 @@ class DataSourceEntitiesProcessor:
         Returns:
             record_group_id if record group was found/created, None otherwise
         """
+
         if record.external_record_group_id is None:
             return None
 
@@ -345,6 +362,7 @@ class DataSourceEntitiesProcessor:
         Create edges between record and record group.
         This should be called AFTER saving the record (when record.id is available).
         """
+
         if not record.id or not record_group_id:
             return
 
@@ -541,6 +559,7 @@ class DataSourceEntitiesProcessor:
         record.org_id = self.org_id
         self.logger.info("Updating existing record: %s, version %d -> %d",
         record.record_name, existing_record.version, record.version)
+
         await tx_store.batch_upsert_records([record])
 
     async def _handle_record_permissions(self, record: Record, permissions: List[Permission], tx_store: TransactionStore) -> None:
@@ -841,7 +860,9 @@ class DataSourceEntitiesProcessor:
         async with self.data_store_provider.transaction() as tx_store:
             existing_record = await tx_store.get_record_by_external_id(connector_id=record.connector_id,
                                                                    external_id=record.external_record_id)
-            await self._handle_updated_record(record, existing_record, tx_store)
+            processed_record = await self._process_record(record, [], tx_store)
+            if processed_record:
+                await self._handle_updated_record(processed_record, existing_record, tx_store)
 
     async def on_record_deleted(self, record_id: str) -> None:
         async with self.data_store_provider.transaction() as tx_store:

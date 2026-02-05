@@ -100,7 +100,6 @@ parser = PydanticOutputParser(pydantic_object=AnswerWithMetadataJSON)
 format_instructions = parser.get_format_instructions()
 
 
-
 async def stream_content(signed_url: str, record_id: Optional[str] = None, file_name: Optional[str] = None) -> AsyncGenerator[bytes, None]:
     # Validate that signed_url is actually a string, not a coroutine
     if not isinstance(signed_url, str):
@@ -338,11 +337,11 @@ async def aiter_llm_stream(llm, messages,parts=None) -> AsyncGenerator[str | dic
 
 # Configuration for Qdrant limits based on context length.
 VECTOR_DB_LIMIT_TIERS = [
-    (17000, 65),  # For context lengths up to 17k
-    (33000, 231),  # For context lengths up to 33k
-    (65000, 320),  # For context lengths up to 65k
+    (17000, 43),  # For context lengths up to 17k
+    (33000, 154),  # For context lengths up to 33k
+    (65000, 213),  # For context lengths up to 65k
 ]
-DEFAULT_VECTOR_DB_LIMIT = 400
+DEFAULT_VECTOR_DB_LIMIT = 266
 
 def get_vectorDb_limit(context_length: int) -> int:
     """Determines the vector db search limit based on the LLM's context length."""

@@ -10,9 +10,9 @@ export interface TopicDefinition {
 
 // Required topics for the application
 export const REQUIRED_KAFKA_TOPICS: TopicDefinition[] = [
-  { topic: 'record-events', numPartitions: 3, replicationFactor: 1 },
-  { topic: 'entity-events', numPartitions: 3, replicationFactor: 1 },
-  { topic: 'sync-events', numPartitions: 3, replicationFactor: 1 },
+  { topic: 'record-events', numPartitions: 1, replicationFactor: 1 },
+  { topic: 'entity-events', numPartitions: 1, replicationFactor: 1 },
+  { topic: 'sync-events', numPartitions: 1, replicationFactor: 1 },
   { topic: 'health-check', numPartitions: 1, replicationFactor: 1 },
 ];
 
@@ -58,7 +58,7 @@ export class KafkaAdminService {
 
       const topicConfigs: ITopicConfig[] = topicsToCreate.map((t) => ({
         topic: t.topic,
-        numPartitions: t.numPartitions ?? 3,
+        numPartitions: t.numPartitions ?? 1,
         replicationFactor: t.replicationFactor ?? 1,
       }));
 
